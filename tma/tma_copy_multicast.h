@@ -26,7 +26,7 @@
 #include "cuda_launch.hpp"
 #include "shared_storage.h"
 #include "smem_helper.hpp"
-
+#include <cooperative_groups.h>
 template <typename _TiledCopyS, typename _TiledCopyD, typename _GmemLayout,
           typename _GmemLayoutOut, typename _SmemLayout, typename _TileShape,
           typename _ClusterShape>
@@ -56,6 +56,7 @@ struct ParamsMulticast {
         gmemLayoutOut(gmemLayoutOut), smemLayout(smemLayout),
         tileShape(tileShape), cluster_shape(cluster_shape) {}
 };
+
 
 template <int kNumThreads, class Element, class Params>
 __global__ static void __launch_bounds__(kNumThreads, 1)
@@ -157,6 +158,142 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   // cute::tma_store_wait<0>();
   cute::cluster_sync();
 }
+
+
+
+template <int kNumThreads, class Element, class Params>
+__global__ static void __launch_bounds__(kNumThreads, 1)
+    copyTMAKernelMulticast_remote(CUTE_GRID_CONSTANT Params const params) {
+  using namespace cute;
+
+  //
+  // Get layouts and tiled copies from Params struct
+  //
+  using GmemLayout = typename Params::GmemLayout;
+  using GmemLayoutOut = typename Params::GmemLayoutOut;
+  using SmemLayout = typename Params::SmemLayout;
+  using TileShape = typename Params::TileShape;
+  using ClusterShape = typename Params::ClusterShape;
+
+  auto &tmaLoad = params.tmaLoad;
+  auto &tmaStore = params.tmaStore;
+  auto &gmemLayout = params.gmemLayout;
+  auto &gmemLayoutOut = params.gmemLayoutOut;
+  auto &smemLayout = params.smemLayout;
+  auto &tileShape = params.tileShape;
+  auto &cluster_shape = params.cluster_shape;
+
+  uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+
+  constexpr uint32_t cluster_size = size(ClusterShape{});
+
+  uint16_t tma_mcast_mask = ((uint16_t(1) << cluster_size) - 1);
+
+  // Use Shared Storage structure to allocate aligned SMEM addresses.
+  extern __shared__ char shared_memory[];
+  extern __shared__ char shared_memory_remote[];
+  using SharedStorage = SharedStorageTMA<Element, SmemLayout>;
+  using SharedStorageRemote = SharedStorageTMA<Element, SmemLayout>;
+  SharedStorage &shared_storage =
+      *reinterpret_cast<SharedStorage *>(shared_memory);
+  SharedStorageRemote &shared_storage_remote =
+      *reinterpret_cast<SharedStorageRemote *>(shared_memory_remote);
+  // Define smem tensor
+  Tensor sS =
+      make_tensor(make_smem_ptr(shared_storage.smem.data()), smemLayout);
+
+  // Get mbarrier object and its value type
+  auto &mbarrier = shared_storage.mbarrier;
+  auto &mbarrier_remote = shared_storage_remote.mbarrier;
+  using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
+  static_assert(cute::is_same_v<BarrierType, uint64_t>,
+                "Value type of mbarrier is uint64_t.");
+
+  // Constants used for TMA
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const bool lane_predicate = cute::elect_one_sync();
+  constexpr int kTmaTransactionBytes =
+      sizeof(ArrayEngine<Element, size(SmemLayout{})>);
+
+  // Prefetch TMA descriptors for load and store
+  if (warp_idx == 0 && lane_predicate) {
+    prefetch_tma_descriptor(tmaLoad.get_tma_descriptor());
+    prefetch_tma_descriptor(tmaStore.get_tma_descriptor());
+  }
+
+  // Get CTA view of gmem tensor
+  Tensor mS = tmaLoad.get_tma_tensor(shape(gmemLayout));
+  auto blkCoord = make_coord(blockIdx.x, blockIdx.y);
+  Tensor gS = local_tile(mS, tileShape, blkCoord);
+
+  auto cta_tmaS = tmaLoad.get_slice(block_rank_in_cluster);
+  auto tSgSX = cta_tmaS.partition_S(gS);
+  auto tSgS = group_modes<1, rank(tSgSX)>(tSgSX);
+  auto tSsSX = cta_tmaS.partition_D(sS);
+  auto tSsS = group_modes<1, rank(tSsSX)>(tSsSX);
+
+  if (warp_idx == 0 and lane_predicate) {
+    mbarrier.init(1 /* arrive count */);
+    mbarrier_remote.init(1 /* arrive count */);
+  }
+  __syncthreads();
+  cute::cluster_sync();
+  cutlass::arch::fence_barrier_init();
+
+  if (warp_idx == 0 and lane_predicate) {
+    mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+    copy(
+        tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier), tma_mcast_mask),
+        tSgS(_, 0), tSsS(_, 0));
+  }
+  __syncthreads();
+
+  mbarrier.wait(0 /* phase */);
+
+  cutlass::arch::fence_view_async_shared();
+
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+
+  if (block_rank_in_cluster == 1) {
+
+    Tensor sS = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem.data(), 0)), smemLayout);
+
+    // copy a tile from remote smem to local smem
+    //cute::copy(sS, tSsS(_, 0), tSsS(_, 0));
+
+    if (warp_idx == 0 and lane_predicate and threadIdx.x == 0 and blockIdx.x == 0 and blockIdx.y == 0 and blockIdx.z == 0) {
+
+    printf(" got remote smem %p\n", make_smem_ptr(cluster.map_shared_rank(shared_storage.smem.data(), 0)));
+  
+    }
+
+
+
+
+
+
+    
+
+  }
+
+  /*
+  // Get CTA view of gmem out tensor
+  auto blkCoordOut = make_coord(blockIdx.x, blockIdx.y, blockIdx.z);
+  auto mD = tmaStore.get_tma_tensor(shape(gmemLayoutOut));
+  auto gD = local_tile(mD, tileShape, blkCoordOut);
+
+  auto cta_tmaD = tmaStore.get_slice(Int<0>{});
+
+  if (warp_idx == 0 and lane_predicate) {
+    cute::copy(tmaStore, cta_tmaD.partition_S(sS), cta_tmaD.partition_D(gD));
+    // cute::tma_store_arrive();
+  }
+  // cute::tma_store_wait<0>();
+  cute::cluster_sync();
+  */
+}
+
 
 template <int kNumThreads, class Element, class Params>
 __global__ static void __launch_bounds__(kNumThreads, 1)
@@ -298,14 +435,16 @@ int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
 
   auto tileShape = make_shape(bM{}, bN{});
   // NOTE: same smem layout for TMA load and store
-  auto smemLayout =
-      tile_to_shape(cfx::getSmemLayoutK<Element, TILE_N>(), tileShape);
+  //auto smemLayout =
+  //    tile_to_shape(cfx::getSmemLayoutK<Element, TILE_N>(), tileShape);
+  
+  auto smemLayout = make_layout(tileShape, LayoutRight{});
   auto tma_load = make_tma_copy(SM90_TMA_LOAD_MULTICAST{}, tensor_S, smemLayout,
                                 tileShape, size(cluster_shape));
   auto tma_load_no_multicast =
       make_tma_copy(SM90_TMA_LOAD{}, tensor_S, smemLayout, tileShape, _1());
 
-  // print(tma_load);
+  //print(tma_load);
   auto tma_store = make_tma_copy(SM90_TMA_STORE{}, tensor_D, smemLayout,
                                  tileShape, Int<1>{});
   // print(tma_store);

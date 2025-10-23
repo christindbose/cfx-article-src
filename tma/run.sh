@@ -1,0 +1,1 @@
+./main --iterations=1
